@@ -85,7 +85,6 @@ import org.apache.ignite.internal.util.typedef.F;
 import org.apache.ignite.internal.util.typedef.internal.CU;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.lang.IgniteBiTuple;
-import org.apache.ignite.marshaller.Marshaller;
 import org.apache.ignite.spi.encryption.EncryptionSpi;
 import org.apache.ignite.spi.encryption.noop.NoopEncryptionSpi;
 import org.apache.ignite.transactions.TransactionState;
@@ -107,34 +106,30 @@ import static org.apache.ignite.internal.processors.cache.verify.IdleVerifyUtili
 /** */
 public class SnapshotChecker {
     /** */
-    protected final IgniteLogger log;
+    private final IgniteLogger log;
 
     /** */
-    @Nullable protected final GridKernalContext kctx;
+    private final GridKernalContext kctx;
 
     /** */
-    protected final EncryptionSpi encryptionSpi;
+    private final EncryptionSpi encryptionSpi;
 
     /** */
-    protected final ExecutorService executor;
+    private final ExecutorService executor;
 
     /** */
-    public SnapshotChecker(
-        GridKernalContext kctx,
-        Marshaller marshaller,
-        ExecutorService executorSrvc
-    ) {
+    public SnapshotChecker(GridKernalContext kctx) {
         this.kctx = kctx;
 
-        this.encryptionSpi = kctx.config().getEncryptionSpi() == null ? new NoopEncryptionSpi() : kctx.config().getEncryptionSpi();
+        encryptionSpi = kctx.config().getEncryptionSpi() == null ? new NoopEncryptionSpi() : kctx.config().getEncryptionSpi();
 
-        this.executor = executorSrvc;
+        executor = kctx.pools().getSnapshotExecutorService();
 
-        this.log = kctx.log(getClass());
+        log = kctx.log(getClass());
     }
 
     /** */
-    protected List<SnapshotMetadata> readSnapshotMetadatas(SnapshotFileTree sft, Object nodeConstId) {
+    private List<SnapshotMetadata> readSnapshotMetadatas(SnapshotFileTree sft, Object nodeConstId) {
         if (!(sft.root().exists() && sft.root().isDirectory()))
             return Collections.emptyList();
 
@@ -195,69 +190,10 @@ public class SnapshotChecker {
     public CompletableFuture<List<SnapshotMetadata>> checkLocalMetas(
         SnapshotFileTree sft,
         int incIdx,
-        @Nullable Collection<Integer> grpIds,
-        Object consId
+        @Nullable Collection<Integer> grpIds
     ) {
-        return CompletableFuture.supplyAsync(() -> {
-            List<SnapshotMetadata> snpMetas = readSnapshotMetadatas(sft, consId);
-
-            for (SnapshotMetadata meta : snpMetas) {
-                byte[] snpMasterKeyDigest = meta.masterKeyDigest();
-
-                if (encryptionSpi.masterKeyDigest() == null && snpMasterKeyDigest != null) {
-                    throw new IllegalStateException("Snapshot '" + meta.snapshotName() + "' has encrypted caches " +
-                        "while encryption is disabled. To restore this snapshot, start Ignite with configured " +
-                        "encryption and the same master key.");
-                }
-
-                if (snpMasterKeyDigest != null && !Arrays.equals(snpMasterKeyDigest, encryptionSpi.masterKeyDigest())) {
-                    throw new IllegalStateException("Snapshot '" + meta.snapshotName() + "' has different master " +
-                        "key digest. To restore this snapshot, start Ignite with the same master key.");
-                }
-
-                Collection<Integer> grpIdsToFind = new HashSet<>(F.isEmpty(grpIds) ? meta.cacheGroupIds() : grpIds);
-
-                if (meta.hasCompressedGroups() && grpIdsToFind.stream().anyMatch(meta::isGroupWithCompression)) {
-                    try {
-                        kctx.compress().checkPageCompressionSupported();
-                    }
-                    catch (NullPointerException | IgniteCheckedException e) {
-                        String grpWithCompr = grpIdsToFind.stream().filter(meta::isGroupWithCompression)
-                            .map(String::valueOf).collect(Collectors.joining(", "));
-
-                        String msg = "Requested cache groups [" + grpWithCompr + "] for check " +
-                            "from snapshot '" + meta.snapshotName() + "' are compressed while " +
-                            "disk page compression is disabled. To check these groups please " +
-                            "start Ignite with ignite-compress module in classpath";
-
-                        throw new IllegalStateException(msg);
-                    }
-                }
-
-                grpIdsToFind.removeAll(meta.partitions().keySet());
-
-                if (!grpIdsToFind.isEmpty() && !new HashSet<>(meta.cacheGroupIds()).containsAll(grpIdsToFind)) {
-                    throw new IllegalArgumentException("Cache group(s) was not found in the snapshot [groups=" + grpIdsToFind +
-                        ", snapshot=" + meta.snapshotName() + ']');
-                }
-            }
-
-            if (incIdx > 0) {
-                List<SnapshotMetadata> metas = snpMetas.stream().filter(m -> m.consistentId().equals(String.valueOf(consId)))
-                    .collect(Collectors.toList());
-
-                if (metas.size() != 1) {
-                    throw new IgniteException("Failed to find single snapshot metafile on local node [locNodeId="
-                        + consId + ", metas=" + snpMetas + ", snpName=" + sft.name()
-                        + ", snpPath=" + sft.root() + "]. Incremental snapshots requires exactly one meta file " +
-                        "per node because they don't support restoring on a different topology.");
-                }
-
-                checkIncrementalSnapshotsExist(metas.get(0), sft, incIdx);
-            }
-
-            return snpMetas;
-        }, executor);
+        return CompletableFuture.supplyAsync(() ->
+            new SnapshotMetadataVerificationTask(kctx.grid(), log, sft, incIdx, grpIds).execute(), executor);
     }
 
     /** Checks that all incremental snapshots are present, contain correct metafile and WAL segments. */
@@ -583,55 +519,8 @@ public class SnapshotChecker {
     }
 
     /** */
-    public static Map<ClusterNode, Exception> reduceMetasResults(
-        String snpName,
-        @Nullable String snpPath,
-        Map<ClusterNode, List<SnapshotMetadata>> allMetas,
-        @Nullable Map<ClusterNode, Exception> exceptions,
-        Object consId
-    ) {
-        Map<ClusterNode, Exception> mappedExceptions = F.isEmpty(exceptions) ? Collections.emptyMap() : new HashMap<>(exceptions);
-
-        SnapshotMetadata firstMeta = null;
-        Set<String> baselineNodes = Collections.emptySet();
-
-        for (Map.Entry<ClusterNode, List<SnapshotMetadata>> nme : allMetas.entrySet()) {
-            ClusterNode node = nme.getKey();
-            Exception e = mappedExceptions.get(node);
-
-            if (e != null) {
-                mappedExceptions.put(node, e);
-
-                continue;
-            }
-
-            for (SnapshotMetadata meta : nme.getValue()) {
-                if (firstMeta == null) {
-                    firstMeta = meta;
-
-                    baselineNodes = new HashSet<>(firstMeta.baselineNodes());
-                }
-
-                baselineNodes.remove(meta.consistentId());
-
-                if (!firstMeta.sameSnapshot(meta)) {
-                    mappedExceptions.put(node, new IgniteException("An error occurred during comparing snapshot metadata "
-                        + "from cluster nodes [firstMeta=" + firstMeta + ", meta=" + meta + ", nodeId=" + node.id() + ']'));
-                }
-            }
-        }
-
-        if (firstMeta == null && mappedExceptions.isEmpty()) {
-            throw new IllegalArgumentException("Snapshot does not exists [snapshot=" + snpName
-                + (snpPath != null ? ", baseDir=" + snpPath : "") + ", consistentId=" + consId + ']');
-        }
-
-        if (!F.isEmpty(baselineNodes) && F.isEmpty(exceptions)) {
-            throw new IgniteException("No snapshot metadatas found for the baseline nodes " +
-                "with consistent ids: " + String.join(", ", baselineNodes));
-        }
-
-        return mappedExceptions;
+    public Map<ClusterNode, Exception> reduceMetasResults(SnapshotFileTree sft, Map<ClusterNode, List<SnapshotMetadata>> metas) {
+        return new SnapshotMetadataVerificationTask(kctx.grid(), log, sft, 0, null).reduce(metas);
     }
 
     /** */
